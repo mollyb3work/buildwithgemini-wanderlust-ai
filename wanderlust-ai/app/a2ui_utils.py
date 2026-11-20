@@ -127,35 +127,128 @@ def _extract_a2ui_messages(text: str) -> list[dict]:
     return messages
 
 
-def _sanitize_image_components(messages: list[dict]) -> None:
-    """Replace un-fetchable <Image> components with a short <Text> note, in place.
+def _heal_and_sanitize_components(messages: list[dict]) -> None:
+    """Repair dangling child references, missing roots, and un-fetchable images in place."""
+    all_defined: set = set()
+    first_card: str | None = None
+    first_id: str | None = None
 
-    Keeps the component's `id` so any parent child-reference still resolves; only
-    the component body changes from Image to Text. An Image is kept only if its
-    url is a literal http(s) link (a path-bound or relative/filename url can't be
-    fetched by adk web and would render as a broken-image icon).
-    """
     for m in messages:
         surface = m.get("surfaceUpdate")
         if not isinstance(surface, dict):
             continue
-        for c in surface.get("components") or []:
+        comps = surface.get("components")
+        if not isinstance(comps, list):
+            continue
+
+        # Sanitize images and collect IDs
+        for c in comps:
+            if not isinstance(c, dict):
+                continue
+            cid = c.get("id")
+            if isinstance(cid, str):
+                all_defined.add(cid)
+                if first_id is None:
+                    first_id = cid
+
+            comp = c.get("component")
+            if not isinstance(comp, dict):
+                continue
+
+            if "Card" in comp and isinstance(cid, str) and first_card is None:
+                first_card = cid
+
+            if "Image" in comp:
+                img = comp.get("Image")
+                url = img.get("url") if isinstance(img, dict) else None
+                literal = url.get("literalString") if isinstance(url, dict) else None
+                if not (isinstance(literal, str) and _HTTP_URL_RE.match(literal)):
+                    c["component"] = {
+                        "Text": {
+                            "text": {"literalString": _IMAGE_NOTE},
+                            "usageHint": "body",
+                        }
+                    }
+
+    # Repair dangling child references in containers (Column, Row, Card)
+    for m in messages:
+        surface = m.get("surfaceUpdate")
+        if not isinstance(surface, dict):
+            continue
+        comps = surface.get("components")
+        if not isinstance(comps, list):
+            continue
+
+        for c in comps:
             if not isinstance(c, dict):
                 continue
             comp = c.get("component")
-            if not isinstance(comp, dict) or "Image" not in comp:
+            if not isinstance(comp, dict):
                 continue
-            img = comp.get("Image")
-            url = img.get("url") if isinstance(img, dict) else None
-            literal = url.get("literalString") if isinstance(url, dict) else None
-            if isinstance(literal, str) and _HTTP_URL_RE.match(literal):
-                continue  # real link -> leave the Image alone
-            c["component"] = {
-                "Text": {
-                    "text": {"literalString": _IMAGE_NOTE},
-                    "usageHint": "body",
-                }
-            }
+            for spec in comp.values():
+                if not isinstance(spec, dict):
+                    continue
+                # If child reference is dangling, drop it
+                if "child" in spec and spec["child"] not in all_defined:
+                    spec.pop("child", None)
+                # If explicitList contains dangling IDs, prune them
+                children = spec.get("children")
+                if isinstance(children, dict):
+                    exp = children.get("explicitList")
+                    if isinstance(exp, list):
+                        children["explicitList"] = [cid for cid in exp if cid in all_defined]
+
+    # Ensure beginRendering root points to a defined component
+    fallback_root = first_card or first_id
+    if fallback_root:
+        for m in messages:
+            br = m.get("beginRendering")
+            if isinstance(br, dict):
+                if not br.get("root") or br["root"] not in all_defined:
+                    br["root"] = fallback_root
+
+
+def _extract_text_fallback(text: str, messages: list[dict]) -> str:
+    """Extract human-readable markdown text from components or raw text if surface fails."""
+    lines: list[str] = []
+
+    # Try extracting literal strings from parsed components
+    for m in messages:
+        su = m.get("surfaceUpdate")
+        if isinstance(su, dict):
+            for c in su.get("components") or []:
+                if isinstance(c, dict):
+                    comp = c.get("component") or {}
+                    for v in comp.values():
+                        if isinstance(v, dict):
+                            t = v.get("text")
+                            if isinstance(t, dict) and isinstance(t.get("literalString"), str):
+                                s = t["literalString"].strip()
+                                if s and s != _IMAGE_NOTE:
+                                    usage = v.get("usageHint")
+                                    if usage in ("h1", "h2"):
+                                        lines.append(f"\n### {s}\n")
+                                    else:
+                                        lines.append(f"- {s}")
+
+    if lines:
+        return "\n".join(lines).strip()
+
+    # Fallback to regex extraction of literalString from raw text
+    matches = re.findall(r'"literalString"\s*:\s*"([^"\\]*(?:\\.[^"\\]*)*)"', text)
+    if matches:
+        regex_lines = []
+        for m in matches:
+            try:
+                decoded = bytes(m, "utf-8").decode("unicode_escape", errors="ignore").strip()
+            except Exception:
+                decoded = m.strip()
+            if decoded and decoded != _IMAGE_NOTE and len(decoded) > 1:
+                regex_lines.append(f"- {decoded}")
+        if regex_lines:
+            return "\n".join(regex_lines)
+
+    return "抱歉，剛才為您規劃的行程內容較為豐富未能完全排版。請嘗試稍候或提出更具體的問題，我將為您提供最清晰的規劃！"
 
 
 def _component_ids_and_refs(components: list) -> tuple[set, set]:
@@ -235,18 +328,23 @@ def a2ui_callback(
 
         messages = _extract_a2ui_messages(text)
         if not messages:
-            continue
-
-        # Turn un-fetchable <Image> URLs into a text note (no broken-image icons).
-        _sanitize_image_components(messages)
-
-        if not _surface_is_renderable(messages):
-            # We recognized A2UI but couldn't recover a renderable surface — the
-            # model emitted invalid JSON, a missing surface body, or an undefined
-            # root/child reference. Return clean text instead of a blank card.
+            # If JSON extract failed completely, try recovering text instead of giving an error
+            recovered_text = _extract_text_fallback(text, [])
             return LlmResponse(
                 content=types.Content(
-                    role="model", parts=[types.Part(text=_FALLBACK_TEXT)]
+                    role="model", parts=[types.Part(text=recovered_text)]
+                )
+            )
+
+        # Repair missing IDs, dangling child refs, and sanitize images in place
+        _heal_and_sanitize_components(messages)
+
+        if not _surface_is_renderable(messages):
+            # If surface still cannot be rendered, recover readable markdown text
+            recovered_text = _extract_text_fallback(text, messages)
+            return LlmResponse(
+                content=types.Content(
+                    role="model", parts=[types.Part(text=recovered_text)]
                 )
             )
 
